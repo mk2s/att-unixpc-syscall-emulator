@@ -114,7 +114,19 @@ pub fn entry(
         .fork => eprint("fork()", .{}),
         .execve => {
             const path = quoteStr(memory, getArg(1), 128, &sbuf);
-            eprint("execve({s}, 0x{X:0>6}, 0x{X:0>6})", .{ path, getArg(2), getArg(3) });
+            eprint("execve({s}, [", .{path});
+            // Decode the argv array (NUL-terminated list of char*).
+            const argv_ptr = getArg(2);
+            var i: u32 = 0;
+            while (i < 32) : (i += 1) {
+                const p = memory.read32(argv_ptr + i * 4);
+                if (p == 0) break;
+                var ab: [128]u8 = undefined;
+                const a = quoteStr(memory, p, 100, &ab);
+                if (i > 0) eprint(", ", .{});
+                eprint("{s}", .{a});
+            }
+            eprint("])", .{});
         },
         .wait => eprint("wait(0x{X:0>6})", .{getArg(1)}),
         .getpid, .getuid, .getgid, .sync, .pause => eprint("{s}()", .{sc.name()}),

@@ -19,6 +19,8 @@ pub const c = struct {
     pub extern "c" fn access(path: [*:0]const u8, mode: c_int) c_int;
     pub extern "c" fn dup(fd: c_int) c_int;
     pub extern "c" fn mkdir(path: [*:0]const u8, mode: c_uint) c_int;
+    pub extern "c" fn chmod(path: [*:0]const u8, mode: c_uint) c_int;
+    pub extern "c" fn chown(path: [*:0]const u8, owner: c_uint, group: c_uint) c_int;
 };
 
 /// Portable errno accessor (src/host_stat.c). Avoids the glibc-specific

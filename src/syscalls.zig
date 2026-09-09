@@ -82,6 +82,8 @@ fn handle(runner: *runloop.Runner, sc: abi.Syscall, number: u16) runloop.Syscall
         .access => return sysAccess(runner),
         .chdir => return sysChdir(runner),
         .dup => return sysDup(runner),
+        .chmod => return sysChmod(runner),
+        .chown => return sysChown(runner),
         .stat => return sysStat(runner, false),
         .fstat => return sysStat(runner, true),
         // --- memory / misc (Task 10) ---
@@ -115,6 +117,7 @@ fn handle(runner: *runloop.Runner, sc: abi.Syscall, number: u16) runloop.Syscall
             return err(runner, @intFromEnum(abi.Errno.EINTR));
         },
         .syslocal => return sysSyslocal(runner),
+        .times => return sysTimes(runner),
         .sync => return ok(runner, 0),
         .nice => return ok(runner, 0),
         // --- process model (Task 11) ---
@@ -205,6 +208,23 @@ fn sysSignal(runner: *runloop.Runner) runloop.SyscallOutcome {
     return ok(runner, abi.SIG_DFL);
 }
 
+/// times(struct tms *buf): fill {utime, stime, cutime, cstime} (4 longs) and
+/// return elapsed clock ticks in D0. We don't track guest CPU time, so report
+/// zeros for the tms fields and a monotonically-derived tick count (HZ=60).
+fn sysTimes(runner: *runloop.Runner) runloop.SyscallOutcome {
+    const buf = runner.arg(1);
+    if (buf != 0) {
+        runner.memory.write32(buf + 0, 0); // tms_utime
+        runner.memory.write32(buf + 4, 0); // tms_stime
+        runner.memory.write32(buf + 8, 0); // tms_cutime
+        runner.memory.write32(buf + 12, 0); // tms_cstime
+    }
+    // elapsed ticks since epoch at HZ=60 (low 32 bits) — good enough for tools
+    // that just want a changing value.
+    const ticks: u32 = @truncate(@as(u64, @bitCast(@as(i64, time(null)))) *% 60);
+    return ok(runner, ticks);
+}
+
 fn sysSyslocal(runner: *runloop.Runner) runloop.SyscallOutcome {
     // syslocal(cmd, ...) — the machine-type/identity call. SYSL_SYSTEM=0
     // returns the machine class; report SYSL_MITI(2) (a plausible 3B1 value).
@@ -229,8 +249,20 @@ fn sysFork(runner: *runloop.Runner) runloop.SyscallOutcome {
         error.NotSupported => return err(runner, @intFromEnum(abi.Errno.ENOMEM)),
         else => return err(runner, @intFromEnum(abi.Errno.EAGAIN)),
     };
-    // Parent: rc = child pid (>0). Child: rc = 0. Both return via D0.
-    return ok(runner, rc);
+    // 3B1 fork ABI: the kernel returns the child pid in D0 to BOTH processes
+    // and uses D1 as the parent/child discriminator (the libc fork stub does
+    // `tstw d1; beq keep; clrl d0` — D1==0 => parent keeps pid, D1!=0 => child
+    // zeroes d0). Host fork() gives the parent the child pid and the child 0;
+    // we set D1 to match so the stub distinguishes them. (In the child D0 is
+    // don't-care since the stub clears it.)
+    const is_child = (rc == 0);
+    if (is_child) {
+        runner.ret2(0, 1); // D0=0 (cleared anyway), D1=1 => child
+    } else {
+        runner.ret2(rc, 0); // D0=child pid, D1=0 => parent
+    }
+    trace.result(rc, false, 0);
+    return .cont;
 }
 
 fn sysExec(runner: *runloop.Runner) runloop.SyscallOutcome {
@@ -253,7 +285,11 @@ fn sysExec(runner: *runloop.Runner) runloop.SyscallOutcome {
         error.NotSupported => return err(runner, @intFromEnum(abi.Errno.EINVAL)),
         else => return err(runner, @intFromEnum(abi.Errno.ENOENT)),
     };
-    // exec succeeded: PC/regs already point at the new entry. Do not advance.
+    // exec succeeded: reset the program break to the new image's, so the new
+    // program's malloc/brk doesn't inherit the previous program's break.
+    const hp: *procmodel.HostProcess = @ptrCast(@alignCast(runner.procmodel.?));
+    runner.brk = hp.new_brk;
+    // PC/regs already point at the new entry. Do not advance past the trap.
     return .restart;
 }
 
@@ -487,6 +523,28 @@ fn sysChdir(runner: *runloop.Runner) runloop.SyscallOutcome {
     const hpath = fs.resolve(gpath, &hbuf) catch return err(runner, @intFromEnum(abi.Errno.ENOENT));
     if (fsmod.c.access(hpath.ptr, 0) < 0) return err(runner, fsmod.hostErrno());
     fs.chdir(gpath) catch return err(runner, @intFromEnum(abi.Errno.ENOENT));
+    return ok(runner, 0);
+}
+
+fn sysChmod(runner: *runloop.Runner) runloop.SyscallOutcome {
+    const fs = fsOf(runner) orelse return err(runner, @intFromEnum(abi.Errno.EACCES));
+    var pbuf: [1024]u8 = undefined;
+    const gpath = runner.argStr(1, &pbuf);
+    const mode = runner.arg(2);
+    var hbuf: [1200]u8 = undefined;
+    const hpath = fs.resolve(gpath, &hbuf) catch return err(runner, @intFromEnum(abi.Errno.ENOENT));
+    if (fsmod.c.chmod(hpath.ptr, mode & 0o7777) < 0) return err(runner, fsmod.hostErrno());
+    return ok(runner, 0);
+}
+
+fn sysChown(runner: *runloop.Runner) runloop.SyscallOutcome {
+    const fs = fsOf(runner) orelse return err(runner, @intFromEnum(abi.Errno.EACCES));
+    var pbuf: [1024]u8 = undefined;
+    const gpath = runner.argStr(1, &pbuf);
+    var hbuf: [1200]u8 = undefined;
+    const hpath = fs.resolve(gpath, &hbuf) catch return err(runner, @intFromEnum(abi.Errno.ENOENT));
+    // Best-effort; chown typically fails for non-root but tools don't care.
+    _ = fsmod.c.chown(hpath.ptr, runner.arg(2), runner.arg(3));
     return ok(runner, 0);
 }
 

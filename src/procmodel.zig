@@ -36,6 +36,8 @@ const libc = if (is_posix) struct {
 
 pub const ProcError = error{ NotSupported, ForkFailed, ExecFailed, PipeFailed, NoChild };
 
+
+
 /// Interface. A backend provides these; the host backend is below.
 pub const ProcessModel = struct {
     ctx: *anyopaque,
@@ -87,6 +89,11 @@ pub const HostProcess = struct {
     allocator: std.mem.Allocator,
     /// Set by exec to signal the run loop to restart at a new entry point.
     exec_entry: ?u32 = null,
+    /// Program break for the just-exec'd image (end of highest section). The
+    /// syscall layer copies this into the Runner after a successful exec, so
+    /// the new program's malloc/brk starts from the right place instead of
+    /// inheriting the previous program's break (which corrupts the heap).
+    new_brk: u32 = 0,
 
     pub fn model(self: *HostProcess) ProcessModel {
         return .{ .ctx = self, .vtable = &vtable };
@@ -140,6 +147,15 @@ pub const HostProcess = struct {
         if (image.is_shared) {
             self.mapShlib() catch {}; // best-effort; guest will fault if truly needed
         }
+
+        // Compute the new program break = end of the highest loaded section
+        // (exact, not page-rounded — matches what crt0 hands to shlbat).
+        var brk: u32 = abi.VUSER_START;
+        for (image.sections) |*s| {
+            const end = s.vaddr + s.size;
+            if (end > brk and s.vaddr < abi.USRSTACK) brk = end;
+        }
+        self.new_brk = brk;
 
         // New stack + registers.
         try self.setupStackAndEntry(image, argv, envp);

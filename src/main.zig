@@ -154,7 +154,14 @@ pub fn runProgram(
     // Stack region: give the top of the user region rw permission so the
     // stack works, then build the initial stack.
     try memory.addRegion(abi.VUSER_START, abi.VUSER_END - abi.VUSER_START, .{ .read = true, .write = true, .exec = true });
-    const envp = [_][]const u8{ "PATH=/bin:/usr/bin", "HOME=/" };
+    // CCROOT is the prefix cc prepends to phase paths (CCROOT/lib/cpp,
+    // CCROOT/lib/ccom, ...). Empty => absolute /lib/cpp etc., which is where
+    // the phases live in the guest tree. Without it, cc's getenv("CCROOT")
+    // returns null and its path-concat routine faults on the null prefix.
+    // cc treats an empty CCROOT the same as unset (it skips the store when the
+    // first byte is NUL), so use "/" — concat yields //lib/cpp which the path
+    // resolver collapses to /lib/cpp where the phases live.
+    const envp = [_][]const u8{ "PATH=/bin:/usr/bin", "HOME=/", "CCROOT=/" };
     const layout = try proc.buildStack(&memory, abi.USRSTACK, prog_args, &envp);
 
     try runloop.installHaltPad(&memory);
@@ -242,6 +249,7 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.eql(u8, args[i], "--trace")) {
             trace.enabled = true;
             i += 1;
+
         } else if (std.mem.eql(u8, args[i], "--root") and i + 1 < args.len) {
             guestroot = args[i + 1];
             i += 2;
