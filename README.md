@@ -20,6 +20,11 @@ Working today (verified against real 3B1 binaries):
 - Runs real utilities: `echo`, `cat`, `pwd`, `date`, `ls` (directory reads),
   `expr`, and the shell `sh -c "..."` driving builtins, external commands
   (`fork`/`exec`/`wait`), sequential commands (`;`), and file redirection (`>`).
+- **Compiles and runs C programs with the native toolchain**: `cc -o prog
+  prog.c` drives the real `cpp` → `ccom` → `as` → `ld` pipeline (via
+  `fork`/`exec`/`wait`) to produce a working COFF executable, which then runs
+  under the emulator. A `printf("hello, world")` program compiles and prints
+  correctly end-to-end.
 - File syscalls against a chroot-style guest root, `brk`/`sbrk` heap, and a set
   of misc syscalls (see `docs/abi.md`).
 - strace-style syscall tracing and fail-fast diagnostics.
@@ -28,9 +33,9 @@ Known gaps (honest status):
 
 - Two-process pipelines (`cmd | cmd`): a pipe-fd lifecycle bug across forked
   emulator processes prevents the second stage from running reliably.
-- The full `cc` compile driver does not complete yet (faults marshalling
-  sub-phase argv). The individual pieces (loader, shlib, fork/exec, file I/O)
-  work; the driver needs more iteration.
+- Two-process pipelines still have the fd-lifecycle issue noted above; the
+  compiler works because cc uses `fork`/`exec`/`wait` with temp files rather
+  than pipes between stages.
 - Windows: `fork`/`exec`/`wait`/`pipe` require host `fork()`, which Windows
   lacks. The build compiles for Windows and single-process programs work, but
   multi-process features return an error. See "Cross-platform" below.
@@ -87,6 +92,18 @@ runupc --root guestroot run guestroot/bin/echo hello world
 runupc --root guestroot run guestroot/bin/cat /etc/passwd
 runupc --root guestroot run guestroot/bin/sh -c "echo hi; expr 6 \* 7"
 runupc --trace --root guestroot run guestroot/bin/date
+
+# compile a C program with the native toolchain, then run the result:
+runupc --root guestroot run guestroot/bin/cc -o /tmp/hw /tmp/hw.c
+runupc --root guestroot run guestroot/tmp/hw
+```
+
+The compiler needs a writable `/tmp` in the guest root and the `CCROOT`
+environment variable (the emulator sets `CCROOT=/` by default so cc finds its
+phases at `/lib/cpp`, `/lib/ccom`, etc.). Example `hw.c`:
+
+```c
+main(){ printf("hello, world\n"); return 0; }
 ```
 
 ## Cross-platform

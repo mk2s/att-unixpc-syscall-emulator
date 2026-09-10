@@ -151,6 +151,14 @@ pub fn runProgram(
         };
     }
 
+    // Low memory (0 .. VUSER_START): map read-only. On the 3B1, page 0 is
+    // present and a null-pointer *read* yields 0 rather than trapping; a lot of
+    // period C (and the bundled toolchain, e.g. ccom's symbol handling) relies
+    // on `*(T*)0` reading as 0. Keep it non-writable so a genuine null *store*
+    // still fails fast. Without this, ccom null-reads fault as "unmapped @ 0x0"
+    // and abort compiles of larger functions.
+    try memory.addRegion(0, abi.VUSER_START, .{ .read = true, .write = false, .exec = false });
+
     // Stack region: give the top of the user region rw permission so the
     // stack works, then build the initial stack.
     try memory.addRegion(abi.VUSER_START, abi.VUSER_END - abi.VUSER_START, .{ .read = true, .write = true, .exec = true });
@@ -198,9 +206,15 @@ pub fn runProgram(
     const status = runloop.run(&runner);
 
     if (runner.aborted) {
-        out("guest aborted (fault: {s} @ 0x{X:0>6}, syscalls={d})\n", .{
-            @tagName(memory.fault.kind), memory.fault.address, runner.syscall_count,
-        });
+        if (runner.timed_out) {
+            out("guest aborted: cycle-budget timeout (syscalls={d}); " ++
+                "raise RUNUPC_MAX_SLICES if this is a legitimate long run\n",
+                .{runner.syscall_count});
+        } else {
+            out("guest aborted (fault: {s} @ 0x{X:0>6}, syscalls={d})\n", .{
+                @tagName(memory.fault.kind), memory.fault.address, runner.syscall_count,
+            });
+        }
         return error.GuestAborted;
     }
     return status;

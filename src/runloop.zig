@@ -19,6 +19,21 @@ const abi = @import("abi.zig");
 
 pub const TRAP0_OPCODE: u16 = 0x4E40;
 
+extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
+
+/// Per-run cycle budget in 20k-cycle slices. Generous by default so real
+/// workloads (cc/cpp/ccom on deep-include kernel sources) complete; it exists
+/// only to stop a truly wedged guest. Override with RUNUPC_MAX_SLICES.
+fn maxSlicesBudget() u64 {
+    if (getenv("RUNUPC_MAX_SLICES")) |s| {
+        const span = std.mem.span(s);
+        if (std.fmt.parseInt(u64, span, 10)) |v| {
+            if (v > 0) return v;
+        } else |_| {}
+    }
+    return 200_000; // 200k * 20k = 4e9 cycles
+}
+
 /// Outcome of servicing a syscall.
 pub const SyscallOutcome = enum {
     /// Continue executing the guest (advance PC past the trap).
@@ -242,9 +257,13 @@ pub fn run(runner: *Runner) u32 {
     defer setActiveRunner(null);
 
     // Execute in small slices until exit/abort. A cycle budget guards against
-    // runaway guests (and buggy stubs) hanging the emulator.
+    // runaway guests (and buggy stubs) hanging the emulator. Real workloads
+    // (e.g. cc/cpp/ccom processing a deep nested-include kernel source) can
+    // legitimately run well past a few tens of millions of cycles, so the
+    // budget is generous; it exists only to stop a truly wedged guest. Override
+    // with RUNUPC_MAX_SLICES for pathological cases.
     var slices: u64 = 0;
-    const max_slices: u64 = 2000; // 2000 * 20k = 4e7 cycles budget
+    const max_slices: u64 = maxSlicesBudget();
     while (runner.exit_status == null and !runner.aborted) {
         _ = cpu.execute(20_000);
         // If a memory fault occurred, fail fast with a full diagnostic dump.

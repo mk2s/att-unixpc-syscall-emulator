@@ -181,6 +181,8 @@ pub const HostProcess = struct {
         argv: []const []const u8,
         envp: []const []const u8,
     ) ProcError!void {
+        // Low memory read-only (see main.zig): page 0 present, null reads -> 0.
+        self.memory.addRegion(0, abi.VUSER_START, .{ .read = true, .write = false, .exec = false }) catch {};
         // Give the user region rwx (details refined by loader perms already).
         self.memory.addRegion(abi.VUSER_START, abi.VUSER_END - abi.VUSER_START, .{ .read = true, .write = true, .exec = true }) catch {};
         const layout = proc.buildStack(self.memory, abi.USRSTACK, argv, envp) catch return error.ExecFailed;
