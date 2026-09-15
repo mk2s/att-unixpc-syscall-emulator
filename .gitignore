@@ -1,6 +1,6 @@
 .zig-cache/
 zig-out/
-vendor/musashi/m68kmake
+zig-pkg/
 *.o
 # Generated 68k test stubs (rebuild with tests/stubs/build_stubs.sh)
 tests/stubs/*.coff

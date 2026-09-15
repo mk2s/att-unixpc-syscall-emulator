@@ -1,0 +1,28 @@
+.{
+    .name = .runupc,
+    .version = "0.1.0",
+    .fingerprint = 0xb45d0149c1f511f9,
+    .minimum_zig_version = "0.17.0-dev",
+    .dependencies = .{
+        // Upstream Musashi 68k core, fetched and unpacked automatically by
+        // `zig build`. No manual untar / vendoring required. Pinned to a
+        // specific commit for reproducibility; the opcode tables
+        // (m68kops.c/.h) are generated from m68k_in.c by m68kmake at build
+        // time (see build.zig), since upstream does not ship them. Our custom
+        // 68010 config lives in src/m68kconf.h, kept outside this dependency so
+        // the fetched tree stays pristine.
+        .musashi = .{
+            .url = "https://github.com/kstenerud/Musashi/archive/313ebf1bd9f4d0d93341eb5ce21fd8a119e9dbdd.tar.gz",
+            .hash = "N-V-__8AAD0zEwD0CPh0wxlM7pKcZjmTPTkje459LJ2NZ4ci",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "tests",
+        "tools",
+        "docs",
+        "README.md",
+    },
+}

@@ -55,12 +55,15 @@ Each target installs into its own `zig-out/bin/<arch>-<os>/` directory, so
 cross-builds (`-Dtarget=...`) don't overwrite each other. For example the
 native Linux binary is `zig-out/bin/x86_64-linux/runupc`.
 
-The Musashi 68k core is vendored under `vendor/musashi/` and compiled with
-`zig cc`. The opcode tables (`m68kops.c/.h`) are pre-generated; to regenerate:
-
-```
-cd vendor/musashi && zig cc -o m68kmake m68kmake.c && ./m68kmake
-```
+The Musashi 68k core is a package dependency (see `build.zig.zon`): `zig build`
+fetches and unpacks it automatically — no manual download or untar. Upstream
+does not ship the generated opcode tables (`m68kops.c/.h`), so the build
+compiles Musashi's `m68kmake` tool and runs it to generate them into the build
+cache. Our 68010 configuration lives in `src/upc_m68kconf.h` (kept out of the
+fetched dependency and selected via `-DMUSASHI_CNF`), which enables the
+per-instruction hook used for `trap #0` interception. To move to a newer
+Musashi, update the `url`/`hash` in `build.zig.zon` (run `zig build` once to get
+the correct hash).
 
 ## Running
 
@@ -138,7 +141,7 @@ src/
   trace.zig      strace-style logging
   host_stat.c    portable stat/fstat + errno shim
   host_dir.c     portable directory reading shim
-vendor/musashi/  vendored Musashi 68k core
+  upc_m68kconf.h Musashi 68010 config (trap-hook wiring); kept out of the dep
 tools/           extract_syscalls.py, inspect_shlib.py, mkstub.py
 tests/stubs/     hand-written 68k test programs + build_stubs.sh
 docs/            abi.md (syscall ABI), shlib.md (shared-lib mechanism)
@@ -159,6 +162,6 @@ docs/            abi.md (syscall ABI), shlib.md (shared-lib mechanism)
 
 ## License / attribution
 
-Musashi is Copyright Karl Stenerud, MIT-licensed (see
-`vendor/musashi/m68k.h`). This emulator was built with the AT&T UNIX PC
+Musashi is Copyright Karl Stenerud, MIT-licensed (fetched as a package
+dependency; see its `m68k.h`). This emulator was built with the AT&T UNIX PC
 technical reference and the machine's own headers/binaries as ABI references.

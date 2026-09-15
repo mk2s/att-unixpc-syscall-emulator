@@ -32,35 +32,30 @@ pub extern fn upc_diropen(path: [*:0]const u8) c_int;
 pub extern fn upc_dirread(handle: c_int, ino_out: *c_ulong, name_out: [*]u8) c_int;
 pub extern fn upc_dirclose(handle: c_int) void;
 
-/// Host O_* flags (Linux/glibc values). We translate the guest's flags to
-/// these. Guest values differ (see abi.zig).
-const H_O_RDONLY: c_int = 0;
-const H_O_WRONLY: c_int = 1;
-const H_O_RDWR: c_int = 2;
-const H_O_CREAT: c_int = 0o100;
-const H_O_EXCL: c_int = 0o200;
-const H_O_TRUNC: c_int = 0o1000;
-const H_O_APPEND: c_int = 0o2000;
-const H_O_NONBLOCK: c_int = 0o4000;
-
 pub fn hostErrno() u16 {
     const e = upc_errno();
     return if (e < 0 or e > 65535) 22 else @intCast(e); // clamp to guest EINVAL
 }
 
-/// Translate guest open flags (abi.O_*) to host flags.
+/// Translate guest open flags (abi.O_*) to the host's O_* flags as a c_int
+/// suitable for the C library open().
+///
+/// The host flag values are OS-specific (e.g. O_CREAT is 0o100 on Linux but
+/// 0x0200 on macOS). Using std.c.O — a per-target packed struct — keeps this
+/// correct across hosts instead of hardcoding Linux/glibc values.
 pub fn translateOpenFlags(guest: u32) c_int {
-    var h: c_int = switch (guest & 0x3) {
-        abi.O_WRONLY => H_O_WRONLY,
-        abi.O_RDWR => H_O_RDWR,
-        else => H_O_RDONLY,
+    var o: std.c.O = .{};
+    o.ACCMODE = switch (guest & 0x3) {
+        abi.O_WRONLY => .WRONLY,
+        abi.O_RDWR => .RDWR,
+        else => .RDONLY,
     };
-    if (guest & abi.O_CREAT != 0) h |= H_O_CREAT;
-    if (guest & abi.O_EXCL != 0) h |= H_O_EXCL;
-    if (guest & abi.O_TRUNC != 0) h |= H_O_TRUNC;
-    if (guest & abi.O_APPEND != 0) h |= H_O_APPEND;
-    if (guest & abi.O_NDELAY != 0) h |= H_O_NONBLOCK;
-    return h;
+    if (guest & abi.O_CREAT != 0) o.CREAT = true;
+    if (guest & abi.O_EXCL != 0) o.EXCL = true;
+    if (guest & abi.O_TRUNC != 0) o.TRUNC = true;
+    if (guest & abi.O_APPEND != 0) o.APPEND = true;
+    if (guest & abi.O_NDELAY != 0) o.NONBLOCK = true;
+    return @bitCast(o);
 }
 
 pub const MAX_FD: usize = abi.NOFILE; // 80

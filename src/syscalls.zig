@@ -819,10 +819,19 @@ test "open/read a file under guestroot" {
     const root = "/tmp/runupc_test_gr";
     _ = fsmod.c.mkdir(root, 0o755); // ignore EEXIST
     const dpath = root ++ "/data.txt";
-    const fd = fsmod.c.open(dpath, 0o1 | 0o100 | 0o1000, 0o644); // WRONLY|CREAT|TRUNC
+    // Remove any stale file from a previous interrupted run so O_CREAT starts
+    // clean (a leftover 0-perm file would make the guest's open() fail EACCES).
+    _ = fsmod.c.unlink(dpath);
+    // Host open flags are OS-specific; build them from std.c.O so this works on
+    // macOS as well as Linux (raw octals here would be Linux-only values).
+    const wflags: c_int = @bitCast(std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true });
+    const fd = fsmod.c.open(dpath, wflags, 0o644);
     try t.expect(fd >= 0);
     _ = fsmod.c.write(fd, "ABCDE", 5);
     _ = fsmod.c.close(fd);
+    // Ensure the file is readable regardless of the process umask, so the
+    // emulated open() under test can read it.
+    _ = fsmod.c.chmod(dpath, 0o644);
     defer _ = fsmod.c.unlink(dpath);
 
     var memory = try mem.Memory.init(t.allocator);
