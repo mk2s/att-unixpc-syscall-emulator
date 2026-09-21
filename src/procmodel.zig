@@ -139,6 +139,19 @@ pub const HostProcess = struct {
         // Clear the guest address space regions and map the new image.
         self.memory.clearRegions();
         self.memory.enforce = false;
+        // Discard the entire previous user address space (text/data/bss/heap/
+        // stack). A real exec(2) replaces the address space wholesale and the
+        // kernel hands the new program zero-filled memory; but our host-fork
+        // backend copied the PARENT's guest memory, so without this the new
+        // image would inherit the parent's stack/heap/bss bytes. That breaks
+        // programs that read an uninitialized auto or bss slot (harmless on
+        // real hardware where those are zero) — e.g. cc picks up a stale parent
+        // stack pointer and faults. Zeroing here (before mapInto lays down the
+        // new image, and before buildStack builds the fresh stack) makes exec
+        // hand off a clean user space, matching UNIX semantics. The shlib
+        // region and low null-read page are outside [VUSER_START,VUSER_END) and
+        // are (re)established separately.
+        self.memory.zero(abi.VUSER_START, abi.VUSER_END - abi.VUSER_START);
         coff.mapInto(&image, self.memory, bytes) catch return error.ExecFailed;
         // Re-install the halt pad (clearRegions removed its mapping).
         @import("runloop.zig").installHaltPad(self.memory) catch {};
