@@ -129,6 +129,7 @@ pub fn runProgram(
     path: []const u8,
     prog_args: []const []const u8,
     guestroot: ?[]const u8,
+    extra_env: []const []const u8,
 ) !u32 {
     const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(8 * 1024 * 1024));
     defer gpa.free(bytes);
@@ -169,8 +170,28 @@ pub fn runProgram(
     // cc treats an empty CCROOT the same as unset (it skips the store when the
     // first byte is NUL), so use "/" — concat yields //lib/cpp which the path
     // resolver collapses to /lib/cpp where the phases live.
-    const envp = [_][]const u8{ "PATH=/bin:/usr/bin", "HOME=/", "CCROOT=/" };
-    const layout = try proc.buildStack(&memory, abi.USRSTACK, prog_args, &envp);
+    // Guest environment: caller-supplied --env vars first, then base defaults
+    // the toolchain needs. A base default is emitted ONLY if no --env entry
+    // already defines that NAME= — so `--env PATH=...` cleanly OVERRIDES the
+    // default rather than leaving two PATH entries (some guest tools honor the
+    // first, others the last; a single entry is unambiguous).
+    var env_list: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer env_list.deinit(gpa);
+    for (extra_env) |e| try env_list.append(gpa, e);
+    const base_env = [_][]const u8{ "PATH=/bin:/usr/bin", "HOME=/", "CCROOT=/" };
+    for (base_env) |b| {
+        // NAME= prefix of this base var (including the '=').
+        const eq = (std.mem.indexOfScalar(u8, b, '=') orelse continue) + 1;
+        var overridden = false;
+        for (extra_env) |e| {
+            if (e.len >= eq and std.mem.eql(u8, e[0..eq], b[0..eq])) {
+                overridden = true;
+                break;
+            }
+        }
+        if (!overridden) try env_list.append(gpa, b);
+    }
+    const layout = try proc.buildStack(&memory, abi.USRSTACK, prog_args, env_list.items);
 
     try runloop.installHaltPad(&memory);
 
@@ -229,8 +250,8 @@ fn mapShlib(gpa: std.mem.Allocator, io: std.Io, memory: *mem.Memory, guestroot: 
     try shlib.loadFromRoot(gpa, memory, bytes);
 }
 
-fn cmdRun(gpa: std.mem.Allocator, io: std.Io, path: []const u8, prog_args: []const []const u8, guestroot: ?[]const u8) !u8 {
-    const status = runProgram(gpa, io, path, prog_args, guestroot) catch |e| {
+fn cmdRun(gpa: std.mem.Allocator, io: std.Io, path: []const u8, prog_args: []const []const u8, guestroot: ?[]const u8, extra_env: []const []const u8) !u8 {
+    const status = runProgram(gpa, io, path, prog_args, guestroot, extra_env) catch |e| {
         out("run error: {s}\n", .{@errorName(e)});
         return 1;
     };
@@ -256,9 +277,11 @@ pub fn main(init: std.process.Init) !void {
 
     const args = try init.minimal.args.toSlice(init.arena.allocator());
 
-    // Global flags: --trace enables strace logging; --root <dir> sets guestroot.
+    // Global flags: --trace enables strace logging; --root <dir> sets guestroot;
+    // --env NAME=VALUE (repeatable) adds a variable to the guest environment.
     var i: usize = 1;
     var guestroot: ?[]const u8 = null;
+    var extra_env: std.ArrayListUnmanaged([]const u8) = .empty;
     while (i < args.len) {
         if (std.mem.eql(u8, args[i], "--trace")) {
             trace.enabled = true;
@@ -267,8 +290,12 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, args[i], "--root") and i + 1 < args.len) {
             guestroot = args[i + 1];
             i += 2;
+        } else if (std.mem.eql(u8, args[i], "--env") and i + 1 < args.len) {
+            try extra_env.append(init.arena.allocator(), args[i + 1]);
+            i += 2;
         } else break;
     }
+    const extra_env_slice = extra_env.items;
     const rest = args[i..]; // rest[0] = subcommand, rest[1] = binary, ...
 
     if (rest.len >= 2 and std.mem.eql(u8, rest[0], "--load")) {
@@ -276,7 +303,7 @@ pub fn main(init: std.process.Init) !void {
     } else if (rest.len >= 2 and std.mem.eql(u8, rest[0], "run")) {
         // argv passed to the guest = [binary, extra args...] (argv[0] = binary).
         const prog_args: []const []const u8 = rest[1..];
-        const code = try cmdRun(gpa, io, rest[1], prog_args, guestroot);
+        const code = try cmdRun(gpa, io, rest[1], prog_args, guestroot, extra_env_slice);
         std.process.exit(code);
     } else if (rest.len >= 2 and std.mem.eql(u8, rest[0], "--dumpstack")) {
         const prog_args: []const []const u8 = rest[1..];

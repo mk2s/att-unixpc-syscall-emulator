@@ -78,6 +78,12 @@ pub const Runner = struct {
     brk: u32 = 0,
     /// umask value (for creat/open mode masking; tracked, applied host-side).
     umask: u32 = 0,
+    /// Per-signal disposition table (handler address, or SIG_DFL=0 / SIG_IGN=1).
+    /// signal(2) returns the PREVIOUS disposition; the toolchain relies on this
+    /// (e.g. cc: `if (signal(SIGINT,SIG_IGN)!=SIG_IGN) signal(SIGINT,cleanup)`).
+    /// A real host fork() copies this struct, so dispositions inherit across
+    /// guest fork just like on UNIX. Index by signal number (0..NSIG-1).
+    sig_disp: [32]u32 = @splat(0),
 
     /// Read the Nth 32-bit syscall argument (1-based). Args live on the user
     /// stack just above the return address pushed by the `jsr` to the libc
@@ -255,6 +261,7 @@ pub fn run(runner: *Runner) u32 {
 
     setActiveRunner(runner);
     defer setActiveRunner(null);
+
 
     // Execute in small slices until exit/abort. A cycle budget guards against
     // runaway guests (and buggy stubs) hanging the emulator. Real workloads

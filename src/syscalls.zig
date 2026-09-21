@@ -17,10 +17,12 @@ const fsmod = @import("fs.zig");
 const procmodel = @import("procmodel.zig");
 
 extern "c" fn write(fd: c_int, buf: [*]const u8, count: usize) isize;
+extern "c" fn getpid() c_int;
 
 /// Module-global "current runner" so the trace arg accessor (a plain fn ptr)
 /// can reach the stack args.
 var cur: ?*runloop.Runner = null;
+
 
 fn traceArg(n: u32) u32 {
     const r = cur orelse return 0;
@@ -30,6 +32,7 @@ fn traceArg(n: u32) u32 {
 /// The dispatcher entry point, installed as Runner.handler.
 pub fn dispatch(runner: *runloop.Runner, number: u16) runloop.SyscallOutcome {
     cur = runner;
+
     trace.entry(runner.memory, number, traceArg);
 
     const sc: abi.Syscall = @enumFromInt(number);
@@ -68,8 +71,14 @@ fn handle(runner: *runloop.Runner, sc: abi.Syscall, number: u16) runloop.Syscall
             return .exit;
         },
         .getpid => {
-            runner.ret2(1, 0); // pid=1, ppid=0
-            trace.result(1, false, 0);
+            // Return the real host pid so each (forked) guest process sees a
+            // DISTINCT pid. The toolchain builds temp filenames from getpid()
+            // (e.g. cc's /tmp/ctm<pid>); a constant pid makes nested cc/cpp/as
+            // under make collide on temp files and corrupt each other. Mask to
+            // 16 bits to fit the guest's short pid_t.
+            const hp: u32 = @as(u32, @intCast(getpid())) & 0x7fff;
+            runner.ret2(hp, 0); // pid=host pid, ppid=0
+            trace.result(hp, false, 0);
             return .cont;
         },
         .write, .swrite => return sysWrite(runner),
@@ -80,6 +89,8 @@ fn handle(runner: *runloop.Runner, sc: abi.Syscall, number: u16) runloop.Syscall
         .lseek => return sysLseek(runner),
         .unlink => return sysUnlink(runner),
         .access => return sysAccess(runner),
+        .link => return sysLink(runner),
+        .utime => return sysUtime(runner),
         .chdir => return sysChdir(runner),
         .dup => return sysDup(runner),
         .chmod => return sysChmod(runner),
@@ -173,10 +184,11 @@ fn sysFcntl(runner: *runloop.Runner) runloop.SyscallOutcome {
     const hfd = fs.get(gfd) orelse return err(runner, @intFromEnum(abi.Errno.EBADF));
     // F_DUPFD=0, F_GETFD=1, F_SETFD=2, F_GETFL=3, F_SETFL=4 (fcntl.h)
     switch (cmd) {
-        0 => { // F_DUPFD: duplicate to lowest fd >= arg
+        0 => { // F_DUPFD: duplicate to lowest guest fd >= arg3 (the minimum).
+            const min = runner.arg(3);
             const newh = fsmod.c.dup(hfd);
             if (newh < 0) return err(runner, fsmod.hostErrno());
-            const gnew = fs.allocFd(newh) orelse {
+            const gnew = fs.allocFdFrom(newh, min) orelse {
                 _ = fsmod.c.close(newh);
                 return err(runner, @intFromEnum(abi.Errno.EMFILE));
             };
@@ -199,13 +211,20 @@ fn sysIoctl(runner: *runloop.Runner) runloop.SyscallOutcome {
 }
 
 fn sysSignal(runner: *runloop.Runner) runloop.SyscallOutcome {
-    // signal(sig, handler): record but don't deliver (no async signals yet).
-    // Return the previous handler (SIG_DFL=0) as the old disposition.
+    // signal(sig, handler): record the new disposition and RETURN THE PREVIOUS
+    // one. We don't deliver async signals, but tracking the disposition is
+    // essential: the toolchain does `if (signal(SIGINT, SIG_IGN) != SIG_IGN)
+    // signal(SIGINT, cleanup)`. Always returning SIG_DFL made cc take the wrong
+    // branch and later fault. Dispositions inherit across fork (host fork()
+    // copies this table), matching UNIX semantics for ignored signals.
     const sig = runner.arg(1);
     const handler = runner.arg(2);
-    _ = sig;
-    _ = handler;
-    return ok(runner, abi.SIG_DFL);
+    if (sig == 0 or sig >= runner.sig_disp.len) {
+        return err(runner, @intFromEnum(abi.Errno.EINVAL));
+    }
+    const prev = runner.sig_disp[sig];
+    runner.sig_disp[sig] = handler;
+    return ok(runner, prev);
 }
 
 /// times(struct tms *buf): fill {utime, stime, cutime, cstime} (4 longs) and
@@ -561,6 +580,47 @@ fn sysDup(runner: *runloop.Runner) runloop.SyscallOutcome {
     return ok(runner, gnew);
 }
 
+/// link(oldpath, newpath): create a hard link. Both paths resolve under the
+/// guest root. make(1)/ar(1) use link+unlink for atomic file replacement.
+fn sysLink(runner: *runloop.Runner) runloop.SyscallOutcome {
+    const fs = fsOf(runner) orelse return err(runner, @intFromEnum(abi.Errno.EACCES));
+    var obuf: [1024]u8 = undefined;
+    var nbuf: [1024]u8 = undefined;
+    const gold = runner.argStr(1, &obuf);
+    const gnew = runner.argStr(2, &nbuf);
+    var hold: [1200]u8 = undefined;
+    var hnew: [1200]u8 = undefined;
+    const holdp = fs.resolve(gold, &hold) catch return err(runner, @intFromEnum(abi.Errno.ENOENT));
+    const hnewp = fs.resolve(gnew, &hnew) catch return err(runner, @intFromEnum(abi.Errno.ENOENT));
+    if (fsmod.c.link(holdp.ptr, hnewp.ptr) < 0) return err(runner, fsmod.hostErrno());
+    return ok(runner, 0);
+}
+
+/// utime(path, times): set access/modification times. `times` is a guest
+/// pointer to two 32-bit big-endian longs {actime, modtime}, or NULL to use
+/// the current time. make(1) calls this to stamp built targets, so getting a
+/// success return (and honoring the times when given) unblocks make-driven
+/// builds.
+fn sysUtime(runner: *runloop.Runner) runloop.SyscallOutcome {
+    const fs = fsOf(runner) orelse return err(runner, @intFromEnum(abi.Errno.EACCES));
+    var pbuf: [1024]u8 = undefined;
+    const gpath = runner.argStr(1, &pbuf);
+    var hbuf: [1200]u8 = undefined;
+    const hpath = fs.resolve(gpath, &hbuf) catch return err(runner, @intFromEnum(abi.Errno.ENOENT));
+    const times_ptr = runner.arg(2);
+    var use_now: c_int = 1;
+    var actime: c_long = 0;
+    var modtime: c_long = 0;
+    if (times_ptr != 0) {
+        use_now = 0;
+        actime = @intCast(runner.memory.read32(times_ptr));
+        modtime = @intCast(runner.memory.read32(times_ptr + 4));
+    }
+    if (upc_host_utime(hpath.ptr, use_now, actime, modtime) < 0)
+        return err(runner, fsmod.hostErrno());
+    return ok(runner, 0);
+}
+
 /// stat/fstat: fill the guest `struct stat` (30 bytes, big-endian) at the
 /// pointer argument. For stat, arg1=path, arg2=statbuf. For fstat, arg1=fd,
 /// arg2=statbuf.
@@ -604,6 +664,7 @@ const HostStat = extern struct {
 
 extern fn upc_host_stat(path: [*:0]const u8, out: *HostStat) c_int;
 extern fn upc_host_fstat(fd: c_int, out: *HostStat) c_int;
+extern fn upc_host_utime(path: [*:0]const u8, use_now: c_int, actime: c_long, modtime: c_long) c_int;
 
 fn host_stat(path: [*:0]const u8, out: *HostStat) c_int {
     return upc_host_stat(path, out);

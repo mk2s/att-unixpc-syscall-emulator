@@ -16,6 +16,7 @@ pub const c = struct {
     pub extern "c" fn write(fd: c_int, buf: [*]const u8, n: usize) isize;
     pub extern "c" fn lseek(fd: c_int, off: c_long, whence: c_int) c_long;
     pub extern "c" fn unlink(path: [*:0]const u8) c_int;
+    pub extern "c" fn link(oldp: [*:0]const u8, newp: [*:0]const u8) c_int;
     pub extern "c" fn access(path: [*:0]const u8, mode: c_int) c_int;
     pub extern "c" fn dup(fd: c_int) c_int;
     pub extern "c" fn mkdir(path: [*:0]const u8, mode: c_uint) c_int;
@@ -171,7 +172,16 @@ pub const Fs = struct {
     /// standard fd (0/1/2) becomes available for reuse, matching Unix dup(2)
     /// which always returns the lowest free descriptor.
     pub fn allocFd(self: *Fs, hfd: i32) ?u32 {
-        var i: usize = 0;
+        return self.allocFdFrom(hfd, 0);
+    }
+
+    /// Allocate the lowest free guest fd that is >= `min`, mapping it to `hfd`.
+    /// This is the fcntl(F_DUPFD, min) contract: the shell relocates a script
+    /// fd to a high number (e.g. 19) and then reads from exactly that number,
+    /// so honoring `min` is required for the ENOEXEC "run as shell script"
+    /// fallback to work.
+    pub fn allocFdFrom(self: *Fs, hfd: i32, min: u32) ?u32 {
+        var i: usize = @min(min, MAX_FD);
         while (i < MAX_FD) : (i += 1) {
             if (self.host_fd[i] < 0) {
                 self.host_fd[i] = hfd;

@@ -54,3 +54,16 @@ int upc_host_fstat(int fd, struct upc_host_stat *out) {
 int upc_errno(void) {
     return errno;
 }
+
+#include <utime.h>
+
+/* Set access/modification times on a path. If use_now is nonzero, both times
+ * are set to the current time (utime(path, NULL)); otherwise actime/modtime
+ * (seconds since epoch) are used. Returns 0 on success, -1 on error. */
+int upc_host_utime(const char *path, int use_now, long actime, long modtime) {
+    if (use_now) return utime(path, (struct utimbuf *)0);
+    struct utimbuf ub;
+    ub.actime  = (time_t)actime;
+    ub.modtime = (time_t)modtime;
+    return utime(path, &ub);
+}
