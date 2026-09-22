@@ -44,6 +44,19 @@ fn out(comptime fmt: []const u8, args: anytype) void {
     hostWrite(1, s);
 }
 
+/// When true, suppress runupc's own status chatter (e.g. the per-process
+/// "guest exited with status N" line). Set by the global `--quiet` flag. This
+/// matters when the guest forks many children (cc/make), where the status line
+/// would otherwise interleave noisily with the build's real output.
+var quiet: bool = false;
+
+/// Like out(), but only when not in --quiet mode. For runupc's own diagnostics
+/// that are useful interactively but noise during a build.
+fn outv(comptime fmt: []const u8, args: anytype) void {
+    if (quiet) return;
+    out(fmt, args);
+}
+
 fn cmdLoad(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !void {
     const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(8 * 1024 * 1024));
     defer gpa.free(bytes);
@@ -255,7 +268,7 @@ fn cmdRun(gpa: std.mem.Allocator, io: std.Io, path: []const u8, prog_args: []con
         out("run error: {s}\n", .{@errorName(e)});
         return 1;
     };
-    out("guest exited with status {d}\n", .{status});
+    outv("guest exited with status {d}\n", .{status});
     return @truncate(status);
 }
 
@@ -286,7 +299,9 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.eql(u8, args[i], "--trace")) {
             trace.enabled = true;
             i += 1;
-
+        } else if (std.mem.eql(u8, args[i], "--quiet")) {
+            quiet = true;
+            i += 1;
         } else if (std.mem.eql(u8, args[i], "--root") and i + 1 < args.len) {
             guestroot = args[i + 1];
             i += 2;
