@@ -201,13 +201,76 @@ fn sysFcntl(runner: *runloop.Runner) runloop.SyscallOutcome {
 }
 
 fn sysIoctl(runner: *runloop.Runner) runloop.SyscallOutcome {
+    const gfd = runner.arg(1);
+    const cmd = runner.arg(2);
+    const argp = runner.arg(3);
+
+    // Mapped raw disk devices answer the 3B1 disk ioctls from the image's
+    // Volume Home Block (VHB), so tools like `iv` and `fsck` can learn the
+    // disk geometry and partition layout. Everything else keeps the ENOTTY
+    // behavior below.
+    if (fsOf(runner)) |fs| {
+        if (fs.isDevice(gfd)) {
+            if (cmd == abi.GDGETA) return gdgeta(runner, fs, gfd, argp);
+            // Other disk ioctls (GDSETA/GDFORMAT/...) aren't emulated yet.
+            return err(runner, @intFromEnum(abi.Errno.EINVAL));
+        }
+    }
+
     // The toolchain / shell probe tty-ness via ioctl. We don't emulate a tty,
     // so report "not a typewriter" for querying fds that aren't the host tty,
     // and success (0) otherwise. Returning ENOTTY is what isatty() expects for
     // non-terminals and keeps cc/sh happy when they check.
-    const gfd = runner.arg(1);
-    _ = gfd;
     return err(runner, @intFromEnum(abi.Errno.ENOTTY));
+}
+
+/// GDGETA: fill the guest `struct gdctl` from the disk image's VHB.
+///
+/// Layouts (big-endian m68k), from the 3B1 <sys/gdisk.h> / <sys/gdioctl.h>:
+///   struct gdswprt {          // 18 bytes
+///     char   name[6];         // @0
+///     ushort cyls;            // @6
+///     ushort heads;           // @8
+///     ushort psectrk;         // @10
+///     ushort pseccyl;         // @12
+///     char   flags;           // @14
+///     char   step;            // @15
+///     ushort sectorsz;        // @16
+///   };
+///   struct vhbd { uint magic@0; int chksum@4; struct gdswprt dsk@8; ... };
+///   struct gdctl { ushort status@0; struct gdswprt params@2; short dsktyp@20; };
+///
+/// We copy the 18-byte gdswprt straight from VHB+8 into gdctl+2 (both are the
+/// same big-endian layout), set status = VALID_VHB|DRV_READY, and pick dsktyp
+/// from the drive name ("WINCHE" -> Winchester HD).
+fn gdgeta(runner: *runloop.Runner, fs: *fsmod.Fs, gfd: u32, argp: u32) runloop.SyscallOutcome {
+    const hfd = fs.get(gfd) orelse return err(runner, @intFromEnum(abi.Errno.EBADF));
+    if (argp == 0) return err(runner, @intFromEnum(abi.Errno.EFAULT));
+
+    // Read the VHB (first sector) without disturbing the guest's file offset.
+    var vhb: [512]u8 = undefined;
+    const n = fsmod.c.pread(hfd, &vhb, vhb.len, 0);
+    if (n < @as(isize, @intCast(vhb.len))) return err(runner, @intFromEnum(abi.Errno.EIO));
+
+    // Validate the VHB magic (big-endian 0x55515651 == "UQVQ").
+    const magic = (@as(u32, vhb[0]) << 24) | (@as(u32, vhb[1]) << 16) |
+        (@as(u32, vhb[2]) << 8) | @as(u32, vhb[3]);
+    if (magic != abi.VHBMAGIC) return err(runner, @intFromEnum(abi.Errno.EINVAL));
+
+    // gdctl.status @0: VALID_VHB (0x0002) | DRV_READY (0x0004).
+    runner.memory.write16(argp + 0, abi.VHB_STATUS_VALID | abi.VHB_STATUS_READY);
+
+    // gdctl.params @2 = VHB.dsk @8, 18 bytes copied verbatim (same BE layout).
+    var i: u32 = 0;
+    while (i < 18) : (i += 1) runner.memory.write8(argp + 2 + i, vhb[8 + i]);
+
+    // gdctl.dsktyp @20: choose from the drive name in dsk.name[6] (VHB+8).
+    // "WINCHE"->HD(0), "FLOPPY"->FD(2); default HD.
+    const dsktyp: u16 = if (std.mem.startsWith(u8, vhb[8..14], "FLOPPY") or
+        std.mem.startsWith(u8, vhb[8..14], "FD")) abi.GD_FD else abi.GD_HD;
+    runner.memory.write16(argp + 20, dsktyp);
+
+    return ok(runner, 0);
 }
 
 fn sysSignal(runner: *runloop.Runner) runloop.SyscallOutcome {
@@ -354,6 +417,65 @@ fn sysPipe(runner: *runloop.Runner) runloop.SyscallOutcome {
 
 // --- file syscall implementations ------------------------------------------
 
+/// Read `len` bytes from a mapped device fd, translating the partition-relative
+/// logical position to physical image offsets one logical sector at a time
+/// (to honor the 17th-sector interleave), copying into guest memory at `buf`.
+/// Advances the fd's logical cursor. Returns the syscall outcome.
+fn deviceRead(runner: *runloop.Runner, g: *fsmod.DeviceGeom, hfd: i32, buf: u32, len: u32) runloop.SyscallOutcome {
+    const secsz: i64 = @intCast(g.secsz);
+    var total: u32 = 0;
+    var addr = buf;
+    var remaining = len;
+    var chunk: [512]u8 = undefined;
+    while (remaining > 0) {
+        // Bytes left in the current logical sector (so we never cross a sector
+        // boundary in one pread — physOf is only linear within a sector).
+        const in_sec: i64 = g.log_pos - @divFloor(g.log_pos, secsz) * secsz;
+        const room: u32 = @intCast(secsz - in_sec);
+        const n = @min(@min(remaining, room), @as(u32, chunk.len));
+        const phys = g.physOf(g.log_pos);
+        const r = fsmod.c.pread(hfd, &chunk, n, @intCast(phys));
+        if (r < 0) return err(runner, fsmod.hostErrno());
+        if (r == 0) break; // EOF
+        const ru: u32 = @intCast(r);
+        var i: u32 = 0;
+        while (i < ru) : (i += 1) runner.memory.write8(addr + i, chunk[i]);
+        total += ru;
+        addr += ru;
+        remaining -= ru;
+        g.log_pos += ru;
+        if (ru < n) break;
+    }
+    return ok(runner, total);
+}
+
+/// Write `len` bytes to a mapped device fd with the same per-sector interleave
+/// translation as deviceRead. Advances the fd's logical cursor.
+fn deviceWrite(runner: *runloop.Runner, g: *fsmod.DeviceGeom, hfd: i32, buf: u32, len: u32) runloop.SyscallOutcome {
+    const secsz: i64 = @intCast(g.secsz);
+    var total: u32 = 0;
+    var addr = buf;
+    var remaining = len;
+    var chunk: [512]u8 = undefined;
+    while (remaining > 0) {
+        const in_sec: i64 = g.log_pos - @divFloor(g.log_pos, secsz) * secsz;
+        const room: u32 = @intCast(secsz - in_sec);
+        const n = @min(@min(remaining, room), @as(u32, chunk.len));
+        var i: u32 = 0;
+        while (i < n) : (i += 1) chunk[i] = runner.memory.read8(addr + i);
+        const phys = g.physOf(g.log_pos);
+        const w = fsmod.c.pwrite(hfd, &chunk, n, @intCast(phys));
+        if (w < 0) return err(runner, fsmod.hostErrno());
+        const wu: u32 = @intCast(w);
+        total += wu;
+        addr += wu;
+        remaining -= wu;
+        g.log_pos += wu;
+        if (wu < n) break;
+    }
+    return ok(runner, total);
+}
+
 fn sysWrite(runner: *runloop.Runner) runloop.SyscallOutcome {
     const gfd = runner.arg(1);
     const buf = runner.arg(2);
@@ -367,6 +489,8 @@ fn sysWrite(runner: *runloop.Runner) runloop.SyscallOutcome {
         return err(runner, @intFromEnum(abi.Errno.EBADF));
     };
     const hfd = fs.get(gfd) orelse return err(runner, @intFromEnum(abi.Errno.EBADF));
+    // Mapped device: write through the logical->physical interleave.
+    if (fs.devGeom(gfd)) |g| return deviceWrite(runner, g, hfd, buf, len);
     // If this fd maps to the real host stdout/stderr AND a test capture sink is
     // active, route through capture (keeps `zig build test` stdout IPC clean).
     if ((hfd == 1 or hfd == 2) and capture != null) {
@@ -417,6 +541,8 @@ fn sysRead(runner: *runloop.Runner) runloop.SyscallOutcome {
     }
 
     const hfd = fs.get(gfd) orelse return err(runner, @intFromEnum(abi.Errno.EBADF));
+    // Mapped device: read through the logical->physical interleave.
+    if (fs.devGeom(gfd)) |g| return deviceRead(runner, g, hfd, buf, len);
     var total: u32 = 0;
     var remaining = len;
     var addr = buf;
@@ -437,12 +563,61 @@ fn sysRead(runner: *runloop.Runner) runloop.SyscallOutcome {
     return ok(runner, total);
 }
 
+/// Open a mapped raw-device slice: open the host image, tag the fd as a device
+/// (so GDGETA works), compute the partition base offset from the VHB, and seek
+/// the host fd to that base so guest offset 0 == partition start. Shared by
+/// open(2) and creat(2). `host_flags` are already host-translated O_* flags.
+fn openMappedDevice(
+    runner: *runloop.Runner,
+    fs: *fsmod.Fs,
+    dev: fsmod.Fs.DeviceHit,
+    host_flags: c_int,
+    mode: u32,
+) runloop.SyscallOutcome {
+    // A device is never "created"; strip O_CREAT/O_TRUNC so creat() on a device
+    // just opens it writable instead of truncating the whole image file.
+    var of: std.c.O = @bitCast(host_flags);
+    of.CREAT = false;
+    of.TRUNC = false;
+    // Prefer O_RDWR on the backing image: we need to read the VHB (to compute
+    // the partition offset) even when the guest asked for write-only, and the
+    // guest's access-mode restriction doesn't need enforcing against our image.
+    // Fall back to the guest's requested mode if the image is read-only.
+    const want = of.ACCMODE;
+    of.ACCMODE = .RDWR;
+    var hfd = fsmod.c.open(dev.host.ptr, @bitCast(of), mode);
+    if (hfd < 0) {
+        of.ACCMODE = want;
+        hfd = fsmod.c.open(dev.host.ptr, @bitCast(of), mode);
+    }
+    if (hfd < 0) return err(runner, fsmod.hostErrno());
+    // Read this slice's geometry (start track + interleave params) from the
+    // image VHB. A bad/missing VHB leaves geom inactive -> plain access.
+    const geom: fsmod.DeviceGeom = fsmod.Fs.readDeviceGeom(hfd, dev.slice) catch .{};
+    const gfd = fs.allocFd(hfd) orelse {
+        _ = fsmod.c.close(hfd);
+        return err(runner, @intFromEnum(abi.Errno.EMFILE));
+    };
+    fs.setDevice(gfd); // route disk ioctls (GDGETA) to VHB emulation
+    fs.setDeviceGeom(gfd, geom); // logical<->physical interleave + cursor
+    return ok(runner, gfd);
+}
+
 fn sysOpen(runner: *runloop.Runner) runloop.SyscallOutcome {
     const fs = fsOf(runner) orelse return err(runner, @intFromEnum(abi.Errno.EACCES));
     var pbuf: [1024]u8 = undefined;
     const gpath = runner.argStr(1, &pbuf);
     const flags = runner.arg(2);
     const mode = runner.arg(3);
+
+    // Mapped raw device (--map-device GUEST=HOST): open the host image file
+    // directly instead of resolving under the guest root. A raw device is a
+    // plain seekable file on the host, so once opened, read/write/lseek/close
+    // operate on the host fd unchanged (no dir-stream, no stat special-casing).
+    if (fs.deviceLookup(gpath)) |dev| {
+        return openMappedDevice(runner, fs, dev, fsmod.translateOpenFlags(flags), mode);
+    }
+
     var hbuf: [1200]u8 = undefined;
     const hpath = fs.resolve(gpath, &hbuf) catch return err(runner, @intFromEnum(abi.Errno.ENOENT));
 
@@ -481,6 +656,13 @@ fn sysCreat(runner: *runloop.Runner) runloop.SyscallOutcome {
     var pbuf: [1024]u8 = undefined;
     const gpath = runner.argStr(1, &pbuf);
     const mode = runner.arg(2);
+
+    // creat() on a mapped raw device just opens it writable (a device isn't
+    // created/truncated). openMappedDevice strips O_CREAT/O_TRUNC.
+    if (fs.deviceLookup(gpath)) |dev| {
+        return openMappedDevice(runner, fs, dev, fsmod.translateOpenFlags(abi.O_WRONLY), mode);
+    }
+
     var hbuf: [1200]u8 = undefined;
     const hpath = fs.resolve(gpath, &hbuf) catch return err(runner, @intFromEnum(abi.Errno.ENOENT));
     // creat(path, mode) == open(path, O_WRONLY|O_CREAT|O_TRUNC, mode)
@@ -507,6 +689,24 @@ fn sysLseek(runner: *runloop.Runner) runloop.SyscallOutcome {
     const off: i32 = @bitCast(runner.arg(2));
     const whence: c_int = @intCast(runner.arg(3));
     const hfd = fs.get(gfd) orelse return err(runner, @intFromEnum(abi.Errno.EBADF));
+
+    // Mapped device: seeks are partition-relative *logical* positions. We track
+    // the cursor ourselves (physical translation happens per read/write), so no
+    // host lseek is issued. SEEK_END is relative to the partition's logical
+    // size, which we don't track precisely; the filesystem tools always seek
+    // with SEEK_SET/SEEK_CUR, so END is unsupported for devices.
+    if (fs.devGeom(gfd)) |g| {
+        const soff: i64 = @as(i64, @as(i32, @bitCast(runner.arg(2))));
+        const newpos: i64 = switch (whence) {
+            0 => soff, // SEEK_SET
+            1 => g.log_pos + soff, // SEEK_CUR
+            else => return err(runner, @intFromEnum(abi.Errno.EINVAL)),
+        };
+        if (newpos < 0) return err(runner, @intFromEnum(abi.Errno.EINVAL));
+        g.log_pos = newpos;
+        return ok(runner, @intCast(newpos));
+    }
+
     const r = fsmod.c.lseek(hfd, off, whence);
     if (r < 0) return err(runner, fsmod.hostErrno());
     return ok(runner, @intCast(r));
@@ -898,7 +1098,7 @@ test "open/read a file under guestroot" {
     var memory = try mem.Memory.init(t.allocator);
     defer memory.deinit();
     defer mem.setActive(null);
-    var fs = try fsmod.Fs.init(t.allocator, root);
+    var fs = try fsmod.Fs.init(t.allocator, root, &.{});
     defer fs.deinit();
 
     // Program: open("/data.txt",0)->d7; read(d7, buf, 5); exit(count).

@@ -292,6 +292,20 @@ pub const STAT_SIZE: u32 = (7 * 2) + (4 * 4);
 pub const DIRECT_SIZE: u32 = 16;
 pub const DIRSIZ: u32 = 14;
 
+// ---------------------------------------------------------------------------
+// 3B1 disk / Volume Home Block (from <sys/gdioctl.h>, <sys/gdisk.h>)
+// ---------------------------------------------------------------------------
+/// GDGETA: get the gdisk structure. GDIOC = ('G'<<8) = 0x4700; GDGETA = |1.
+pub const GDGETA: u32 = 0x4701;
+/// VHB magic ("UQVQ", big-endian 0x55515651).
+pub const VHBMAGIC: u32 = 0x55515651;
+/// gdctl.status bits: F_CT_FMT (valid VHB read) and F_READY (drive ready).
+pub const VHB_STATUS_VALID: u32 = 0x0002; // VALID_VHB / F_CT_FMT
+pub const VHB_STATUS_READY: u32 = 0x0004; // DRV_READY / F_READY
+/// gdctl.dsktyp disk-type codes: HD=Winchester, FD=floppy.
+pub const GD_HD: u16 = 0;
+pub const GD_FD: u16 = 2;
+
 test "syscall numbers match verified fixture" {
     // Fixture: the plan's required set (read/write/open/close/exit/fork/
     // exec/wait/brk/lseek) plus a few UNIX-PC-specific ones. These values

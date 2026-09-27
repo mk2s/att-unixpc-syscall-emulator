@@ -130,6 +130,7 @@ pub fn runProgram(
     prog_args: []const []const u8,
     guestroot: ?[]const u8,
     extra_env: []const []const u8,
+    device_map: []const fsmod.DeviceMap,
 ) !u32 {
     const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(8 * 1024 * 1024));
     defer gpa.free(bytes);
@@ -138,7 +139,7 @@ pub fn runProgram(
     defer memory.deinit();
     mem.setActive(&memory);
 
-    var fs = try fsmod.Fs.init(gpa, guestroot orelse ".");
+    var fs = try fsmod.Fs.init(gpa, guestroot orelse ".", device_map);
     defer fs.deinit();
 
     var image = try coff.load(gpa, &memory, bytes);
@@ -250,8 +251,8 @@ fn mapShlib(gpa: std.mem.Allocator, io: std.Io, memory: *mem.Memory, guestroot: 
     try shlib.loadFromRoot(gpa, memory, bytes);
 }
 
-fn cmdRun(gpa: std.mem.Allocator, io: std.Io, path: []const u8, prog_args: []const []const u8, guestroot: ?[]const u8, extra_env: []const []const u8) !u8 {
-    const status = runProgram(gpa, io, path, prog_args, guestroot, extra_env) catch |e| {
+fn cmdRun(gpa: std.mem.Allocator, io: std.Io, path: []const u8, prog_args: []const []const u8, guestroot: ?[]const u8, extra_env: []const []const u8, device_map: []const fsmod.DeviceMap) !u8 {
+    const status = runProgram(gpa, io, path, prog_args, guestroot, extra_env, device_map) catch |e| {
         out("run error: {s}\n", .{@errorName(e)});
         return 1;
     };
@@ -282,6 +283,7 @@ pub fn main(init: std.process.Init) !void {
     var i: usize = 1;
     var guestroot: ?[]const u8 = null;
     var extra_env: std.ArrayListUnmanaged([]const u8) = .empty;
+    var device_map: std.ArrayListUnmanaged(fsmod.DeviceMap) = .empty;
     while (i < args.len) {
         if (std.mem.eql(u8, args[i], "--trace")) {
             trace.enabled = true;
@@ -293,9 +295,37 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, args[i], "--env") and i + 1 < args.len) {
             try extra_env.append(init.arena.allocator(), args[i + 1]);
             i += 2;
+        } else if (std.mem.eql(u8, args[i], "--map-device") and i + 1 < args.len) {
+            // --map-device GUEST=HOST : redirect opens of the guest device path
+            // GUEST (e.g. /dev/rfp002) to the host image file HOST. Split on the
+            // FIRST '=' so host paths may themselves contain '='.
+            const spec = args[i + 1];
+            const eq = std.mem.indexOfScalar(u8, spec, '=') orelse {
+                out("error: --map-device expects GUEST=HOST, got '{s}'\n", .{spec});
+                std.process.exit(2);
+            };
+            const guest = spec[0..eq];
+            const host = spec[eq + 1 ..];
+            if (guest.len == 0 or host.len == 0) {
+                out("error: --map-device GUEST and HOST must both be non-empty: '{s}'\n", .{spec});
+                std.process.exit(2);
+            }
+            // NUL-terminate the host path for open(2).
+            const host_z = try init.arena.allocator().allocSentinel(u8, host.len, 0);
+            @memcpy(host_z, host);
+            // Decode the drive number from the device name so sibling slices on
+            // the same physical drive resolve to this same image automatically.
+            const drive: ?u8 = if (fsmod.parseDiskName(guest)) |id| id.drive else null;
+            try device_map.append(init.arena.allocator(), .{
+                .guest = guest,
+                .host = host_z,
+                .drive = drive,
+            });
+            i += 2;
         } else break;
     }
     const extra_env_slice = extra_env.items;
+    const device_map_slice = device_map.items;
     const rest = args[i..]; // rest[0] = subcommand, rest[1] = binary, ...
 
     if (rest.len >= 2 and std.mem.eql(u8, rest[0], "--load")) {
@@ -303,7 +333,7 @@ pub fn main(init: std.process.Init) !void {
     } else if (rest.len >= 2 and std.mem.eql(u8, rest[0], "run")) {
         // argv passed to the guest = [binary, extra args...] (argv[0] = binary).
         const prog_args: []const []const u8 = rest[1..];
-        const code = try cmdRun(gpa, io, rest[1], prog_args, guestroot, extra_env_slice);
+        const code = try cmdRun(gpa, io, rest[1], prog_args, guestroot, extra_env_slice, device_map_slice);
         std.process.exit(code);
     } else if (rest.len >= 2 and std.mem.eql(u8, rest[0], "--dumpstack")) {
         const prog_args: []const []const u8 = rest[1..];
